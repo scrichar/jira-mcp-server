@@ -3,7 +3,6 @@ import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Version3Client } from 'jira.js';
 import { z } from 'zod';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -17,16 +16,34 @@ try {
   console.error("Error loading .env file:", e);
 }
 
-// Initialize Jira client
-const jira = new Version3Client({
-  host: process.env.JIRA_HOST!,
-  authentication: {
-    basic: {
-      email: process.env.JIRA_EMAIL!,
-      apiToken: process.env.JIRA_API_TOKEN!,
-    },
-  },
-});
+// JIRA configuration
+const JIRA_HOST = process.env.JIRA_HOST || '';
+const JIRA_BEARER_TOKEN = process.env.JIRA_BEARER_TOKEN || process.env.JIRA_API_TOKEN || '';
+
+// Helper function to make JIRA API requests with Bearer token
+async function jiraRequest(endpoint: string, options: RequestInit = {}): Promise<any> {
+  const url = `${JIRA_HOST}/rest/api/2${endpoint}`;
+  
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${JIRA_BEARER_TOKEN}`,
+    'Content-Type': 'application/json',
+    ...((options.headers as Record<string, string>) || {}),
+  };
+
+  const response = await fetch(url, {
+    ...options,
+    headers,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`JIRA API error (${response.status}): ${errorText}`);
+  }
+
+  // Handle empty responses (like for transitions)
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
 
 // Type definitions
 interface JiraTicket {
@@ -34,7 +51,18 @@ interface JiraTicket {
   description: string;
   projectKey: string;
   issueType: string;
-  parent?: string; // Optional parent/epic key for next-gen projects
+  parent?: string;
+  customFields?: Record<string, any>;
+}
+
+interface JiraEpic {
+  summary: string;
+  description: string;
+  projectKey: string;
+  epicName: string;
+  epicCategory?: string;
+  productOwner?: string;
+  uxOwner?: string;
 }
 
 interface JiraComment {
@@ -50,8 +78,19 @@ const TicketSchema = z.object({
   summary: z.string().describe("The ticket summary"),
   description: z.string().describe("The ticket description"),
   projectKey: z.string().describe("The project key (e.g., PROJECT)"),
-  issueType: z.string().describe("The type of issue (e.g., Task, Bug)"),
+  issueType: z.string().describe("The type of issue (e.g., Task, Bug, Epic)"),
   parent: z.string().optional().describe("The parent/epic key (for next-gen projects)"),
+  customFields: z.record(z.any()).optional().describe("Custom fields as key-value pairs (e.g., {\"customfield_10620\": \"Epic Name\"})"),
+});
+
+const EpicSchema = z.object({
+  summary: z.string().describe("The epic summary/title"),
+  description: z.string().describe("The epic description"),
+  projectKey: z.string().describe("The project key (e.g., LH)"),
+  epicName: z.string().describe("The epic name (required for epics)"),
+  epicCategory: z.string().optional().describe("The epic category"),
+  productOwner: z.string().optional().describe("The product owner username"),
+  uxOwner: z.string().optional().describe("The UX owner username"),
 });
 
 const CommentSchema = z.object({
@@ -62,35 +101,10 @@ const StatusUpdateSchema = z.object({
   transitionId: z.string().describe("The ID of the transition to perform"),
 });
 
-// Helper function to recursively extract text from ADF nodes
-function extractTextFromADF(node: any): string {
-  if (!node) {
-    return '';
-  }
-
-  // Handle text nodes directly
-  if (node.type === 'text' && node.text) {
-    return node.text;
-  }
-
-  let text = '';
-  // Handle block nodes like paragraph, heading, etc.
-  if (node.content && Array.isArray(node.content)) {
-    text = node.content.map(extractTextFromADF).join('');
-    // Add a newline after paragraphs for better formatting
-    if (node.type === 'paragraph') {
-      text += '\n';
-    }
-  }
-
-  return text;
-}
-
 // Helper function to validate Jira configuration
 function validateJiraConfig(): string | null {
-  if (!process.env.JIRA_HOST) return "JIRA_HOST environment variable is not set";
-  if (!process.env.JIRA_EMAIL) return "JIRA_EMAIL environment variable is not set";
-  if (!process.env.JIRA_API_TOKEN) return "JIRA_API_TOKEN environment variable is not set";
+  if (!JIRA_HOST) return "JIRA_HOST environment variable is not set";
+  if (!JIRA_BEARER_TOKEN) return "JIRA_BEARER_TOKEN or JIRA_API_TOKEN environment variable is not set";
   return null;
 }
 
@@ -104,7 +118,6 @@ function validateAndFormatProjectKeys(projectKeys: string): string[] {
 
 // Helper function to escape special characters in JQL text search
 function escapeJQLText(text: string): string {
-  // Escape special characters: + - & | ! ( ) { } [ ] ^ ~ * ? \ /
   return text.replace(/[+\-&|!(){}[\]^~*?\\\/]/g, '\\$&');
 }
 
@@ -131,15 +144,15 @@ server.tool(
 
     try {
       const query = jql || 'assignee = currentUser() ORDER BY updated DESC';
-      const tickets = await jira.issueSearch.searchForIssuesUsingJql({ jql: query });
+      const data = await jiraRequest(`/search?jql=${encodeURIComponent(query)}&maxResults=50&fields=key,summary,status`);
       
-      if (!tickets.issues || tickets.issues.length === 0) {
+      if (!data.issues || data.issues.length === 0) {
         return {
           content: [{ type: "text", text: "No tickets found" }],
         };
       }
 
-      const formattedTickets = tickets.issues.map((issue) => {
+      const formattedTickets = data.issues.map((issue: any) => {
         const summary = issue.fields?.summary || 'No summary';
         const status = issue.fields?.status?.name || 'Unknown status';
         return `${issue.key}: ${summary} (${status})`;
@@ -171,17 +184,14 @@ server.tool(
     }
 
     try {
-      const ticket = await jira.issues.getIssue({
-        issueIdOrKey: ticketId,
-        fields: ['summary', 'status', 'issuetype', 'description', 'parent', 'issuelinks'],
-      });
+      const ticket = await jiraRequest(`/issue/${ticketId}?fields=key,summary,status,issuetype,description,parent,issuelinks`);
 
       const formattedTicket = [
         `Key: ${ticket.key}`,
         `Summary: ${ticket.fields?.summary || 'No summary'}`,
         `Status: ${ticket.fields?.status?.name || 'Unknown status'}`,
         `Type: ${ticket.fields?.issuetype?.name || 'Unknown type'}`,
-        `Description:\n${extractTextFromADF(ticket.fields?.description) || 'No description'}`,
+        `Description:\n${ticket.fields?.description || 'No description'}`,
         `Parent: ${ticket.fields?.parent?.key || 'No parent'}`
       ];
 
@@ -190,14 +200,12 @@ server.tool(
       if (Array.isArray(links) && links.length > 0) {
         formattedTicket.push('\nLinked Issues:');
         for (const link of links) {
-          // Outward (this issue is the source)
           if (link.outwardIssue) {
             const key = link.outwardIssue.key;
             const summary = link.outwardIssue.fields?.summary || 'No summary';
             const type = link.type?.outward || link.type?.name || 'Related';
             formattedTicket.push(`- [${type}] ${key}: ${summary}`);
           }
-          // Inward (this issue is the target)
           if (link.inwardIssue) {
             const key = link.inwardIssue.key;
             const summary = link.inwardIssue.fields?.summary || 'No summary';
@@ -235,32 +243,25 @@ server.tool(
     }
 
     try {
-      const commentsResult = await jira.issueComments.getComments({ issueIdOrKey: ticketId });
+      const data = await jiraRequest(`/issue/${ticketId}/comment`);
       
-      if (!commentsResult.comments || commentsResult.comments.length === 0) {
+      if (!data.comments || data.comments.length === 0) {
         return {
           content: [{ type: "text", text: "No comments found for this ticket." }],
         };
       }
 
-      const formattedComments = commentsResult.comments.map(comment => {
+      const formattedComments = data.comments.map((comment: any) => {
         const author = comment.author?.displayName || 'Unknown Author';
-        // Comments also use ADF, so we need to parse them
-        const body = extractTextFromADF(comment.body) || 'No comment body'; 
+        const body = comment.body || 'No comment body';
         const createdDate = comment.created ? new Date(comment.created).toLocaleString() : 'Unknown date';
-        return `[${createdDate}] ${author}:\n${body.trim()}\n---`; // Added trim() and separator
-      }).join('\n\n'); // Separate comments with double newline
+        return `[${createdDate}] ${author}:\n${body}\n---`;
+      }).join('\n\n');
 
       return {
         content: [{ type: "text", text: formattedComments }],
       };
     } catch (error) {
-      // Handle cases where the ticket might not exist or other API errors
-      if ((error as any).response?.status === 404) {
-          return {
-              content: [{ type: "text", text: `Ticket ${ticketId} not found.` }],
-          };
-      }
       return {
         content: [{ type: "text", text: `Failed to fetch comments: ${(error as Error).message}` }],
       };
@@ -270,7 +271,7 @@ server.tool(
 
 server.tool(
   "create_ticket",
-  "Create a new Jira ticket",
+  "Create a new Jira ticket with optional custom fields",
   {
     ticket: TicketSchema,
   },
@@ -290,13 +291,18 @@ server.tool(
         issuetype: { name: ticket.issueType },
       };
 
-      // Add parent/epic link if specified
       if (ticket.parent) {
         fields.parent = { key: ticket.parent };
       }
 
-      const newTicket = await jira.issues.createIssue({
-        fields: fields,
+      // Add custom fields if provided
+      if (ticket.customFields) {
+        Object.assign(fields, ticket.customFields);
+      }
+
+      const newTicket = await jiraRequest('/issue', {
+        method: 'POST',
+        body: JSON.stringify({ fields }),
       });
 
       return {
@@ -305,6 +311,176 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Failed to create ticket: ${(error as Error).message}` }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "create_epic",
+  "Create a new Jira Epic with required fields (Epic Name, Category, Owners)",
+  {
+    epic: EpicSchema,
+  },
+  async ({ epic }: { epic: JiraEpic }) => {
+    const configError = validateJiraConfig();
+    if (configError) {
+      return {
+        content: [{ type: "text", text: `Configuration error: ${configError}` }],
+      };
+    }
+
+    try {
+      // Known custom field IDs for LH project epics
+      // customfield_10620: Epic Name
+      // customfield_14510: Epic Category
+      // customfield_14511: Product Owner
+      // customfield_14512: UX Owner
+      const fields: any = {
+        project: { key: epic.projectKey },
+        summary: epic.summary,
+        description: epic.description,
+        issuetype: { name: 'Epic' },
+        customfield_10620: epic.epicName,  // Epic Name (required)
+      };
+
+      // Add optional fields if provided
+      if (epic.epicCategory) {
+        fields.customfield_14510 = { value: epic.epicCategory };
+      }
+      if (epic.productOwner) {
+        fields.customfield_14511 = { name: epic.productOwner };
+      }
+      if (epic.uxOwner) {
+        fields.customfield_14512 = { name: epic.uxOwner };
+      }
+
+      const newEpic = await jiraRequest('/issue', {
+        method: 'POST',
+        body: JSON.stringify({ fields }),
+      });
+
+      return {
+        content: [{ type: "text", text: `Created epic: ${newEpic.key}\nURL: ${JIRA_HOST}/browse/${newEpic.key}` }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Failed to create epic: ${(error as Error).message}` }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_create_meta",
+  "Get the required and available fields for creating issues in a project",
+  {
+    projectKey: z.string().describe("The project key (e.g., LH)"),
+    issueType: z.string().optional().describe("Filter by issue type (e.g., Epic, Story, Bug)"),
+  },
+  async ({ projectKey, issueType }: { projectKey: string; issueType?: string }) => {
+    const configError = validateJiraConfig();
+    if (configError) {
+      return {
+        content: [{ type: "text", text: `Configuration error: ${configError}` }],
+      };
+    }
+
+    try {
+      let url = `/issue/createmeta?projectKeys=${projectKey}&expand=projects.issuetypes.fields`;
+      if (issueType) {
+        url += `&issuetypeNames=${encodeURIComponent(issueType)}`;
+      }
+      
+      const data = await jiraRequest(url);
+      
+      if (!data.projects || data.projects.length === 0) {
+        return {
+          content: [{ type: "text", text: `No project found with key: ${projectKey}` }],
+        };
+      }
+
+      const project = data.projects[0];
+      const result: string[] = [`Project: ${project.key} - ${project.name}\n`];
+
+      for (const type of project.issuetypes || []) {
+        result.push(`\n== Issue Type: ${type.name} ==`);
+        const fields = type.fields || {};
+        
+        const requiredFields: string[] = [];
+        const optionalFields: string[] = [];
+        
+        for (const [fieldId, fieldInfo] of Object.entries(fields) as [string, any][]) {
+          const fieldStr = `  ${fieldId}: ${fieldInfo.name}${fieldInfo.required ? ' (REQUIRED)' : ''}`;
+          if (fieldInfo.required) {
+            requiredFields.push(fieldStr);
+          } else if (fieldId.startsWith('customfield_')) {
+            optionalFields.push(fieldStr);
+          }
+        }
+        
+        if (requiredFields.length > 0) {
+          result.push('\nRequired Fields:');
+          result.push(...requiredFields);
+        }
+        if (optionalFields.length > 0) {
+          result.push('\nCustom Fields:');
+          result.push(...optionalFields.slice(0, 20)); // Limit output
+          if (optionalFields.length > 20) {
+            result.push(`  ... and ${optionalFields.length - 20} more`);
+          }
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: result.join('\n') }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Failed to get create meta: ${(error as Error).message}` }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "update_ticket",
+  "Update a Jira ticket's fields (summary, description)",
+  {
+    ticketId: z.string().describe("The Jira ticket ID (e.g., PROJECT-123)"),
+    summary: z.string().optional().describe("New summary/title for the ticket"),
+    description: z.string().optional().describe("New description for the ticket"),
+  },
+  async ({ ticketId, summary, description }: { ticketId: string; summary?: string; description?: string }) => {
+    const configError = validateJiraConfig();
+    if (configError) {
+      return {
+        content: [{ type: "text", text: `Configuration error: ${configError}` }],
+      };
+    }
+
+    if (!summary && !description) {
+      return {
+        content: [{ type: "text", text: "No fields to update. Provide at least summary or description." }],
+      };
+    }
+
+    try {
+      const fields: any = {};
+      if (summary) fields.summary = summary;
+      if (description) fields.description = description;
+
+      await jiraRequest(`/issue/${ticketId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ fields }),
+      });
+
+      return {
+        content: [{ type: "text", text: `Updated ticket ${ticketId}` }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Failed to update ticket: ${(error as Error).message}` }],
       };
     }
   }
@@ -326,9 +502,9 @@ server.tool(
     }
 
     try {
-      await jira.issueComments.addComment({
-        issueIdOrKey: ticketId,
-        comment: comment.body,
+      await jiraRequest(`/issue/${ticketId}/comment`, {
+        method: 'POST',
+        body: JSON.stringify({ body: comment.body }),
       });
 
       return {
@@ -358,9 +534,9 @@ server.tool(
     }
 
     try {
-      await jira.issues.doTransition({
-        issueIdOrKey: ticketId,
-        transition: { id: status.transitionId },
+      await jiraRequest(`/issue/${ticketId}/transitions`, {
+        method: 'POST',
+        body: JSON.stringify({ transition: { id: status.transitionId } }),
       });
 
       return {
@@ -391,62 +567,49 @@ server.tool(
     }
 
     try {
-      // Validate and format project keys
       const projects = validateAndFormatProjectKeys(projectKeys);
       if (projects.length === 0) {
         return {
-          content: [{ type: "text", text: "No valid project keys provided. Please provide at least one project key." }],
+          content: [{ type: "text", text: "No valid project keys provided." }],
         };
       }
 
-      // Escape the search text for JQL
       const escapedText = escapeJQLText(searchText);
-
-      // Construct the JQL query
       const jql = `text ~ "${escapedText}" AND project IN (${projects.join(',')}) ORDER BY updated DESC`;
 
-      // Execute the search with description field included
-      const searchResults = await jira.issueSearch.searchForIssuesUsingJql({
-        jql,
-        maxResults,
-        fields: ['summary', 'status', 'updated', 'project', 'description'],
-      });
+      const data = await jiraRequest(`/search?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=key,summary,status,updated,project,description`);
 
-      if (!searchResults.issues || searchResults.issues.length === 0) {
+      if (!data.issues || data.issues.length === 0) {
         return {
           content: [{ type: "text", text: `No tickets found matching "${searchText}" in projects: ${projects.join(', ')}` }],
         };
       }
 
-      // Format the results with descriptions
-      const formattedResults = searchResults.issues.map(issue => {
+      const formattedResults = data.issues.map((issue: any) => {
         const summary = issue.fields?.summary || 'No summary';
         const status = issue.fields?.status?.name || 'Unknown status';
         const project = issue.fields?.project?.key || 'Unknown project';
         const updated = issue.fields?.updated ? 
           new Date(issue.fields.updated).toLocaleString() :
           'Unknown date';
-        const description = issue.fields?.description ? 
-          extractTextFromADF(issue.fields.description) : 
-          'No description';
+        const description = issue.fields?.description || 'No description';
         
         return `[${project}] ${issue.key}: ${summary}
 Status: ${status} (Updated: ${updated})
 Description:
-${description.trim()}
+${typeof description === 'string' ? description.substring(0, 500) : 'No description'}
 ----------------------------------------\n`;
       }).join('\n');
 
-      const totalResults = searchResults.total || 0;
+      const totalResults = data.total || 0;
       const headerText = `Found ${totalResults} ticket${totalResults !== 1 ? 's' : ''} matching "${searchText}"\n\n`;
 
       return {
         content: [{ type: "text", text: headerText + formattedResults }],
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
       return {
-        content: [{ type: "text", text: `Failed to search tickets: ${errorMessage}` }],
+        content: [{ type: "text", text: `Failed to search tickets: ${(error as Error).message}` }],
       };
     }
   }
@@ -455,24 +618,21 @@ ${description.trim()}
 // Start the server
 async function main() {
   try {
-    // Check Jira configuration
     const configError = validateJiraConfig();
     if (configError) {
       console.error(`Jira configuration error: ${configError}`);
       console.error("Please configure the required environment variables.");
-      console.error("Starting server in limited mode (tools will return configuration instructions)");
     }
 
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("Jira MCP Server running on stdio");
+    console.error("Jira MCP Server running on stdio (using Bearer token auth)");
   } catch (error) {
     console.error("Error starting Jira MCP server:", error);
     process.exit(1);
   }
 }
 
-// Handle process signals
 process.on('SIGINT', () => {
   console.error('Received SIGINT signal, shutting down...');
   process.exit(0);
@@ -491,4 +651,4 @@ process.on('uncaughtException', (error) => {
 main().catch((error) => {
   console.error("Fatal error in main():", error);
   process.exit(1);
-}); 
+});
